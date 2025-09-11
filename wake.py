@@ -1,68 +1,113 @@
-# wake.py — dependency-free probe; only launches Playwright if needed
-import os, sys, re, time
+# Wake the Streamlit app by visiting the URL and clicking the wake button if present.
+# Saves a screenshot to wake_screenshot.png either way.
+
+import os
+import sys
 from pathlib import Path
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-APP_URL = os.environ.get("APP_URL") or (sys.argv[1] if len(sys.argv) > 1 else None)
+APP_URL = os.environ.get("APP_URL", "").strip()
 if not APP_URL:
-    raise SystemExit("Set APP_URL or pass the app URL as an argument")
-APP_URL = APP_URL.rstrip("/") + "/?embed=true"
+    print("ERROR: APP_URL environment variable not set.", file=sys.stderr)
+    sys.exit(1)
 
-SLEEP_RE = re.compile(r"(gone to sleep|wake up|back up|get this app back|riattiva)", re.I)
-AWAKE_HINTS = re.compile(r"(streamlit|data-testid=\"stapp|carry\-in|new arr|active aes)", re.I)
+URL = APP_URL.rstrip("/") + "/?embed=true"
+SCREENSHOT = Path("wake_screenshot.png")
 
-def tiny_png(path="wake_screenshot.png"):
-    import base64
-    b64 = b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBoV0o5AsAAAAASUVORK5CYII="
-    Path(path).write_bytes(base64.b64decode(b64))
+WAKE_BUTTON_TEXTS = [
+    "Wake this app up",
+    "Wake up",
+    "Get this app back",
+    "Back up",
+    "Riattiva",  # Italian banner variant
+]
 
-def http_fetch(url):
-    # stdlib HTTP client (no third-party deps)
-    import urllib.request, urllib.error
+SLEEP_TEXT_SNIPPETS = [
+    "gone to sleep", "wake up", "riattiva", "get this app back", "back up"
+]
+
+
+def maybe_click_wake(page):
+    # If sleep banner exists, click wake button (try a few variants)
+    banner_present = False
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "CI-wake/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            status = r.getcode()
-            html = r.read().decode("utf-8", errors="ignore")
-        return status, html
+        html = page.content().lower()
+        banner_present = any(snippet in html for snippet in SLEEP_TEXT_SNIPPETS)
     except Exception:
-        return 0, ""
+        pass
 
-def http_probe(url) -> bool:
-    status, html = http_fetch(url)
-    html_l = html.lower()
-    return (
-        status == 200
-        and not SLEEP_RE.search(html_l)
-        and AWAKE_HINTS.search(html_l)
-    )
+    if not banner_present:
+        return False
 
-def browser_wake(url):
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, wait_until="load", timeout=90_000)
-        # Click wake/“Back up”/“Riattiva” if present
-        try:
-            page.get_by_role("button", name=re.compile(r"(wake|back up|riattiva)", re.I)).click(timeout=4000)
-            page.wait_for_load_state("domcontentloaded", timeout=120_000)
-        except PWTimeout:
-            pass
-        time.sleep(1.5)
-        page.screenshot(path="wake_screenshot.png")
-        browser.close()
+    for txt in WAKE_BUTTON_TEXTS:
+        btn = page.get_by_role("button", name=txt)
+        if btn and btn.count() > 0:
+            try:
+                btn.first.click(timeout=5000)
+                return True
+            except Exception:
+                pass
+
+    # Fallback: click any button in the banner region
+    try:
+        page.locator("button").first.click(timeout=5000)
+        return True
+    except Exception:
+        return False
+
+
+def wait_for_streamlit(page, timeout_ms=120_000):
+    # Wait for Streamlit root or any well-known element to appear
+    try:
+        page.wait_for_selector('[data-testid="stApp"], .main, text=/streamlit/i', timeout=timeout_ms)
+        return True
+    except PWTimeout:
+        return False
+
 
 def main():
-    if http_probe(APP_URL):
-        print("✅ App already awake — skipping browser.")
-        tiny_png()  # leave a small artifact for the upload step
-        return
-    print("ℹ️  Probe suggests the app is asleep or ambiguous; opening browser…")
-    browser_wake(APP_URL)
-    if http_probe(APP_URL):
-        print("✅ App is awake.")
-    else:
-        print("ℹ️  Visit completed; screenshot uploaded.")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+        )
+        context = browser.new_context(
+            viewport={"width": 1280, "height": 2000},
+            user_agent="CI-waker",
+        )
+        page = context.new_page()
+        status = "unknown"
+
+        try:
+            page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
+
+            clicked = maybe_click_wake(page)
+            if clicked:
+                # Give the app time to boot
+                page.wait_for_load_state("networkidle", timeout=120_000)
+
+            ready = wait_for_streamlit(page, timeout_ms=120_000 if clicked else 30_000)
+            status = "awake" if ready else "not_ready"
+
+            # Always try to capture something
+            page.screenshot(path=str(SCREENSHOT), full_page=True)
+        except Exception as e:
+            status = f"error: {e}"
+            # Best-effort partial screenshot
+            try:
+                page.screenshot(path=str(SCREENSHOT))
+            except Exception:
+                pass
+        finally:
+            context.close()
+            browser.close()
+
+        print(f"STATUS: {status}")
+
 
 if __name__ == "__main__":
     main()
