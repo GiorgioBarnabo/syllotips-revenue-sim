@@ -1,35 +1,65 @@
 name: Wake Streamlit App
-
 on:
-  schedule:
-    - cron: "0 */10 * * *"   # every 10 hours
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 6-22 * * 1-5"   # every 30m on weekdays (adjust as you like)
 
 jobs:
   wake:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout (no code needed, but useful for artifacts)
-        uses: actions/checkout@v4
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Playwright
+      # ---- Fast probe (no browser) ----
+      - name: Probe app (fast)
+        id: probe
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
         run: |
-          pip install playwright
+          python - <<'PY'
+          import os, re, requests, sys, base64, pathlib
+          url = os.environ["APP_URL"].rstrip("/") + "/?embed=true"
+          asleep_re = re.compile(r"(gone to sleep|wake up|back up|get this app back|riattiva)", re.I)
+          awake_hints = re.compile(r"(streamlit|data-testid=\"stapp|carry\-in|new arr|active aes)", re.I)
+          ok = False
+          try:
+            r = requests.get(url, timeout=30, headers={"User-Agent":"CI-probe"})
+            html = r.text.lower()
+            ok = (r.status_code==200 and not asleep_re.search(html) and awake_hints.search(html))
+          except Exception as e:
+            print("probe_error:", e)
+          print("AWAKE:", ok)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write(f"awake={'true' if ok else 'false'}\n")
+          # create a tiny PNG now if awake so the upload step always finds a file
+          if ok:
+            b64 = b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBoV0o5AsAAAAASUVORK5CYII="
+            pathlib.Path('wake_screenshot.png').write_bytes(base64.b64decode(b64))
+          PY
+
+      # ---- Only install Playwright if the app looks asleep ----
+      - name: Install Playwright
+        if: steps.probe.outputs.awake != 'true'
+        run: |
+          pip install -q playwright
           playwright install --with-deps chromium
 
-      - name: Visit & wake the app
+      - name: Wake (browser)
+        if: steps.probe.outputs.awake != 'true'
         env:
-          APP_URL: https://syllotips-revenue-sim-9dyzegyskgrab2bmabbgxe.streamlit.app/
+          APP_URL: ${{ secrets.APP_URL }}
         run: |
           python wake.py
 
-      - name: Upload screenshot (optional)
+      - name: Upload screenshot
         uses: actions/upload-artifact@v4
         with:
           name: wake-screenshot
           path: wake_screenshot.png
+          if-no-files-found: warn
