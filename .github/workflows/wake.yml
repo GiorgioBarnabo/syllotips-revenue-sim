@@ -1,0 +1,35 @@
+name: Wake Streamlit App
+
+on:
+  schedule:
+    - cron: "0 */10 * * *"   # every 10 hours
+  workflow_dispatch:
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (no code needed, but useful for artifacts)
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Visit & wake the app
+        env:
+          APP_URL: https://syllotips-revenue-sim-9dyzegyskgrab2bmabbgxe.streamlit.app/
+        run: |
+          python wake.py
+
+      - name: Upload screenshot (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: wake-screenshot
+          path: wake_screenshot.png
