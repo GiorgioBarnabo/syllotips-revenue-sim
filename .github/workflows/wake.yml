@@ -1,63 +1,91 @@
-name: Wake Streamlit app
+name: Wake Streamlit
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours (UTC)
-  workflow_dispatch: {}
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:
+
+concurrency:
+  group: wake-streamlit
+  cancel-in-progress: false
 
 jobs:
   wake:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # Fast path: lightweight HTTP probe (no Playwright) — also drops a tiny PNG when awake
-      - name: Probe app (HTTP)
+      # ---------- Cheap probe (no browser) ----------
+      - name: Probe app (no-JS)
         id: probe
         env:
           APP_URL: ${{ secrets.APP_URL }}
-        shell: bash
         run: |
           python - <<'PY'
-          import os, re, base64, pathlib, urllib.request, urllib.error
+          import os, re, urllib.request, sys, base64, pathlib
           url = os.environ["APP_URL"].rstrip("/") + "/?embed=true"
-          asleep_re   = re.compile(r"(gone to sleep|wake up|back up|get this app back|riattiva)", re.I)
-          awake_hints = re.compile(r"(streamlit|data-testid=\"stapp|carry\-in|new arr|active aes)", re.I)
-          ok = False
+
+          # Sleep markers shown by the "Zzzz" page (EN/IT + a couple of variants)
+          asleep_re = re.compile(
+              r"(?:\bzzzz\b|gone\s+to\s+sleep|wake\s+it\s+back\s+up|get\s+this\s+app\s+back\s+up|riattiva|torna\s+online)",
+              re.I,
+          )
+          # Treat as AWAKE only if the Streamlit app container is in the HTML
+          # (present in server HTML, not only after client JS)
+          awake_re = re.compile(r'data-testid\s*=\s*["\']stapp', re.I)  # stAppViewContainer
+
+          state = "unknown"
           try:
-              req = urllib.request.Request(url, headers={"User-Agent": "CI-probe"})
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  status = r.getcode()
-                  html = r.read().decode("utf-8", errors="ignore").lower()
-              ok = bool(status == 200 and not asleep_re.search(html) and awake_hints.search(html))
+            req = urllib.request.Request(url, headers={"User-Agent": "CI-probe"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+              status = resp.getcode()
+              html = resp.read().decode("utf-8", errors="ignore").lower()
+
+            is_sleep = bool(asleep_re.search(html))
+            is_awake = bool(awake_re.search(html))
+
+            if status == 200 and is_awake and not is_sleep:
+              state = "awake"
+            elif status == 200 and is_sleep:
+              state = "sleep"
+            else:
+              state = "unknown"
           except Exception as e:
-              print("probe_error:", e)
-          print("AWAKE:", ok)
+            print("probe_error:", e, file=sys.stderr)
+            state = "unknown"
+
+          print("STATE:", state)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"awake={'true' if ok else 'false'}\n")
-          # write a tiny PNG so the artifact step always finds a file when awake
-          if ok:
-              b64=b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBoV0o5AsAAAAASUVORK5CYII="
-              pathlib.Path("wake_screenshot.png").write_bytes(__import__("base64").b64decode(b64))
+            f.write(f"state={state}\n")
+            # backward-compat for older expressions
+            f.write(f"awake={'true' if state == 'awake' else 'false'}\n")
+
+          # When already awake, drop a tiny PNG so the artifact step always has a file
+          if state == "awake":
+            b64 = b"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBoV0o5AsAAAAASUVORK5CYII="
+            pathlib.Path("wake_screenshot.png").write_bytes(base64.b64decode(b64))
           PY
 
-      # Slow path: actually click the wake button with Playwright only if the probe says it's sleeping
-      - name: Install Playwright
-        if: steps.probe.outputs.awake == 'false'
+      - name: Add run summary
+        run: |
+          echo "### Probe result: \`${{ steps.probe.outputs.state }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- Only wake when not already awake ----------
+      - name: Install Playwright (chromium)
+        if: steps.probe.outputs.state != 'awake'
         run: |
           pip install playwright
           playwright install --with-deps chromium
 
-      - name: Wake the app (Playwright)
-        if: steps.probe.outputs.awake == 'false'
+      - name: Wake with Playwright
+        if: steps.probe.outputs.state != 'awake'
         env:
           APP_URL: ${{ secrets.APP_URL }}
         run: |

@@ -1,113 +1,72 @@
-# Wake the Streamlit app by visiting the URL and clicking the wake button if present.
-# Saves a screenshot to wake_screenshot.png either way.
-
-import os
-import sys
-from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import os, re, time
 
-APP_URL = os.environ.get("APP_URL", "").strip()
-if not APP_URL:
-    print("ERROR: APP_URL environment variable not set.", file=sys.stderr)
-    sys.exit(1)
+URL = os.environ["APP_URL"].rstrip("/") + "/?embed=true"
 
-URL = APP_URL.rstrip("/") + "/?embed=true"
-SCREENSHOT = Path("wake_screenshot.png")
+SLEEP_TEXT = re.compile(
+    r"(?:\bzzzz\b|gone\s+to\s+sleep|wake\s+it\s+back\s+up|get\s+this\s+app\s+back\s+up|riattiva|torna\s+online)",
+    re.I,
+)
+APP_READY_SELECTOR = '[data-testid="stAppViewContainer"], [data-testid^="stapp"]'
 
-WAKE_BUTTON_TEXTS = [
-    "Wake this app up",
-    "Wake up",
-    "Get this app back",
-    "Back up",
-    "Riattiva",  # Italian banner variant
+WAKE_BUTTON_SELECTORS = [
+    'role=button[name=/get this app back up/i]',
+    'text=/get this app back up/i',
+    'role=button[name=/riattiva|torna online/i]',
+    'text=/riattiva|torna online/i',
 ]
 
-SLEEP_TEXT_SNIPPETS = [
-    "gone to sleep", "wake up", "riattiva", "get this app back", "back up"
-]
-
-
-def maybe_click_wake(page):
-    # If sleep banner exists, click wake button (try a few variants)
-    banner_present = False
-    try:
-        html = page.content().lower()
-        banner_present = any(snippet in html for snippet in SLEEP_TEXT_SNIPPETS)
-    except Exception:
-        pass
-
-    if not banner_present:
-        return False
-
-    for txt in WAKE_BUTTON_TEXTS:
-        btn = page.get_by_role("button", name=txt)
-        if btn and btn.count() > 0:
-            try:
-                btn.first.click(timeout=5000)
-                return True
-            except Exception:
-                pass
-
-    # Fallback: click any button in the banner region
-    try:
-        page.locator("button").first.click(timeout=5000)
-        return True
-    except Exception:
-        return False
-
-
-def wait_for_streamlit(page, timeout_ms=120_000):
-    # Wait for Streamlit root or any well-known element to appear
-    try:
-        page.wait_for_selector('[data-testid="stApp"], .main, text=/streamlit/i', timeout=timeout_ms)
-        return True
-    except PWTimeout:
-        return False
-
-
-def main():
+def wake():
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-            ],
-        )
-        context = browser.new_context(
-            viewport={"width": 1280, "height": 2000},
-            user_agent="CI-waker",
-        )
-        page = context.new_page()
-        status = "unknown"
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+        ctx = browser.new_context(viewport={"width": 1280, "height": 2200}, user_agent="CI-waker")
+        page = ctx.new_page()
 
+        # 1) Load
+        page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
+
+        # 2) If we can already see the app container, just screenshot and exit
         try:
-            page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_selector(APP_READY_SELECTOR, timeout=3_000)
+            page.screenshot(path="wake_screenshot.png", full_page=True)
+            ctx.close(); browser.close()
+            return
+        except PWTimeout:
+            pass
 
-            clicked = maybe_click_wake(page)
-            if clicked:
-                # Give the app time to boot
-                page.wait_for_load_state("networkidle", timeout=120_000)
+        # 3) If sleep page is there, click the wake button (be generous with selectors)
+        try:
+            # quick text sniff of the DOM
+            dom_text = page.content().lower()
+            sleeping = bool(SLEEP_TEXT.search(dom_text))
 
-            ready = wait_for_streamlit(page, timeout_ms=120_000 if clicked else 30_000)
-            status = "awake" if ready else "not_ready"
+            if sleeping:
+                clicked = False
+                for sel in WAKE_BUTTON_SELECTORS:
+                    loc = page.locator(sel)
+                    if loc.count() > 0:
+                        try:
+                            loc.first.click(timeout=10_000)
+                            clicked = True
+                            break
+                        except Exception:
+                            pass
+                if not clicked:
+                    # fallback: click any visible primary button (sleep page has a single one)
+                    page.locator("button").first.click(timeout=10_000)
 
-            # Always try to capture something
-            page.screenshot(path=str(SCREENSHOT), full_page=True)
-        except Exception as e:
-            status = f"error: {e}"
-            # Best-effort partial screenshot
+            # 4) Wait for the app container to appear (cold start can take a bit)
+            page.wait_for_selector(APP_READY_SELECTOR, timeout=120_000)
+        except Exception:
+            # Even if something goes wrong, take whatever we have for debugging
+            pass
+        finally:
+            # Always save a screenshot for inspection
             try:
-                page.screenshot(path=str(SCREENSHOT))
+                page.screenshot(path="wake_screenshot.png", full_page=True)
             except Exception:
                 pass
-        finally:
-            context.close()
-            browser.close()
-
-        print(f"STATUS: {status}")
-
+            ctx.close(); browser.close()
 
 if __name__ == "__main__":
-    main()
+    wake()
